@@ -104,3 +104,38 @@ Cùng code vòng 2, 3 lần chạy thử trước khi chốt: 78.64, 87.27, 86.0
 - **Một lần chạy mỗi phiên bản:** cả agent lẫn judge có tính ngẫu nhiên. Với cùng code vòng 2, bốn lần chạy cho 78.64 / 87.27 / 86.05 / 81.36; từng case dao động tới 20–35 điểm. Chênh lệch tổng giữa before và after (+4.3) nhỏ hơn dao động này, nên cần chạy nhiều lần mỗi phiên bản (và lý tưởng là judge khác model) để so sánh đáng tin cậy. `eval_before.json` cũng chỉ là một lần chạy.
 - **Điều chỉnh trên chính bộ eval:** vòng 2 được phát triển bằng cách đọc lỗi trên 22 case này, nên điểm `eval_after` có thể cao hơn hiệu quả thực trên câu hỏi mới.
 - **Các kiểm tra trong loop:** chỉ kiểm tra những gì xác định được bằng chuỗi — URL có mặt, URL gắn với mã incident được nhắc, URL có xuất hiện trong kết quả tool, liên kết `/incidents/<mã>` chưa đọc. Chúng không chứng minh mọi claim đều có nguồn, không phát hiện suy luận sai (như A5 ở lần chạy trước) hay khẳng định trạng thái khi tool lỗi (H7), và chỉ nhận ra liên kết có dạng `/incidents/<mã>`.
+
+## Bonus: 5 status API (`eval_bonus.json`)
+
+Cấu hình: `openai / gpt-4o-mini`, judge `gpt-4o-mini`, `max_steps` 16, dataset `bonus`.
+
+| | Lần 1 (bản bonus đầu) | `eval_bonus.json` (bản cuối) |
+|---|---|---|
+| Điểm bộ bonus | 66.5 | **81.5** |
+| `bonus_points_0_15` | 9.97 | **12.22** |
+| Case vi phạm kiểm tra bằng code | 2 (B6 thiếu `get_incident_details`, B10 chỉ gọi Vercel 1 lần) | 1 (B6) |
+| Model calls / token agent (input, output) | 36 / 81,353, 6,528 | 38 / 91,847, 5,529 |
+| Chi phí ước tính cả judge | ~$0.022 | ~$0.022 |
+
+Điểm theo case (lần 1 → cuối): B1 80→65, B2 85→100, B3 55→55, B4 80→95, B5 75→100, B6 50→50, B7 55→100, B8 100→100, B9 35→100, B10 50→50. Lần 1 được lưu ở `eval_results_bonus_v1.json` (gitignore, không nộp); giữa hai lần chỉ sửa prompt bổ sung và thêm kiểm tra retry ở dưới, `eval_bonus.json` là lần chạy duy nhất của bản cuối.
+
+Thay đổi trong `agent.py` cho bonus (không hard-code câu trả lời hay mã incident):
+
+- **Kết nối tools:** dùng `getattr(tools, 'schemas', SCHEMAS)`; nếu bộ tools có `system_prompt` thì dùng nó và ghép thêm `EXTRA_RULES` (quy tắc chung về nhiều provider, 429, tham số, pagination, nhiễu, nguồn, injection). Tools bài chính không có hai thuộc tính này nên vẫn dùng `SYSTEM_PROMPT` cũ. Danh sách provider đọc từ schema.
+- **Retry 429:** lỗi `RATE_LIMITED` luôn được trả lại cho model kèm `agent_note` ("429 không phải outage", đã thử bao nhiêu lần). Loop đếm số lần 429 theo từng tool (kèm provider nếu có); chờ theo `retry_after_seconds`/`Retry-After` nếu ≤ 5 giây (không có thì 1 giây), lâu hơn thì dừng retry; sau **3 lần** 429 thì không gọi API nữa — call tiếp theo vẫn được trả kết quả `RETRY_LIMIT_REACHED` cho đúng `tool_call_id` và ghi event `tool_blocked` (không phải `tool`) trong trace. Event `rate_limited` ghi attempt, retry_after, thời gian chờ và có dừng không.
+- **Chưa retry sau 429 tạm thời:** nếu tool bị 429 còn lượt mà model định trả lời luôn, loop ghi `validation_unretried_rate_limit` và yêu cầu gọi lại một lần. Bằng chứng B10 (bản cuối): `rate_limited` (attempt 1) → `validation_unretried_rate_limit` → gọi lại `get_vercel_status` thành công; vi phạm "Cần gọi get_vercel_status ít nhất 2 lần" của lần 1 không còn.
+- **Lỗi tham số:** `INVALID_ARGUMENTS` trả lại model kèm ghi chú "sửa tham số rồi gọi lại". B5: lần đầu lỗi định dạng giả lập, lần hai thành công, 100 điểm.
+- **Pagination:** mỗi kết quả `get_incident_details` có `next_offset` được kèm `agent_note` cho biết đã đọc bao nhiêu/tổng số update và offset chưa đọc đầu tiên, nhắc không nói đã xem hết timeline. Không ép đọc hết (test contract cho phép model dừng ở trang đầu nếu đủ). B2: model đọc Vercel `sps6n39gm4sg` ở offset 0, 2, 4, 6 tới `next_offset = null`.
+- **Liên kết sang provider khác:** kiểm tra liên kết chưa đọc nay xác định provider theo host của URL (githubstatus.com → github). B2: update Vercel trỏ tới `githubstatus.com/incidents/93njd414rpbx` → `validation_unread_reference` (provider github) → model đọc incident GitHub đó.
+- **Context/nhiễu:** prompt yêu cầu bỏ qua `distractors` và trả lời đúng trọng tâm; B7 (tổng quan npm, có injection) từ liệt kê 8 incident lịch sử → chỉ trạng thái + nguồn, không xuất marker injection.
+- **Provider không hỗ trợ:** prompt cấm gọi tool của bên khác thay thế; B9 (Linear/Slack) từ gọi cả 5 status tool → không gọi tool nào; khi model thêm link status page Linear/Slack không có trong kết quả tool, `validation_unknown_url` yêu cầu bỏ.
+
+Giới hạn còn lại:
+
+- **B6 (50):** model vẫn không gọi `get_incident_details` dù prompt yêu cầu đọc chi tiết khi hỏi về trạng thái/phạm vi incident — chưa có kiểm tra bằng code cho việc này vì khó xác định chắc chắn câu hỏi nào cần chi tiết.
+- **B3 (55):** retry thành công nhưng judge cho rằng answer chưa nêu rõ đã gặp 429 và thử lại.
+- **B1 (80 → 65):** judge trừ vì answer ghi description "Partial System Outage" thay vì indicator `major` của Cloudflare; thay đổi giữa hai lần ở case này không đến từ code (B1 không chạm tới retry hay pagination).
+- **Chi phí pagination:** B2 dùng 13 model calls, 11 lần `get_incident_details` (đọc hết cả timeline GitHub 13 update dù câu hỏi chỉ cần một update của Vercel). Giới hạn 3 update/trang làm số bước tăng nhanh.
+- **429 thật:** chỉ kiểm tra bằng unit test với HTTP 429 giả (`Retry-After: 2`) và kịch bản giả lập; chưa chạy `--mode live` khi API thật rate limit. Chờ bằng `time.sleep` trong loop làm chậm run tương ứng.
+- **Đánh giá:** cùng giới hạn như bài chính — judge cùng model, một lần chạy mỗi phiên bản, và bản cuối được chỉnh sau khi đọc lỗi trên chính 10 case này.
+- **Ảnh hưởng tới bài chính:** các thay đổi bonus chỉ kích hoạt với tools có `schemas`/`system_prompt` riêng, lỗi 429 hoặc timeline phân trang — không xuất hiện ở bộ tools bài chính. Hai thay đổi chạm tới đường chạy bài chính là ghi chú cho lỗi `INVALID_ARGUMENTS` và cách xác định provider của liên kết (`githubstatus.com` → github, cùng kết quả như trước với dữ liệu bài chính). `eval_after.json` được chạy trước các thay đổi này và không chạy lại; 37/37 test bài chính vẫn pass.
